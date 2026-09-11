@@ -10,6 +10,7 @@ defmodule Electric.Client.Stream do
     :id,
     :client,
     :poll_state,
+    :sse_worker,
     parser: {Electric.Client.ValueMapper, []},
     buffer: :queue.new(),
     replica: :default,
@@ -28,9 +29,11 @@ defmodule Electric.Client.Stream do
       """
     ],
     live: [
-      type: :boolean,
+      type: {:in, [true, false, :sse]},
       default: true,
-      doc: "If `true` (the default) reads an infinite stream of update messages from the server."
+      type_spec: quote(do: boolean() | :sse),
+      doc:
+        "Use `true` (default) for long polling, `false` for a snapshot, or `:sse` for HTTP Server-Sent Events after the snapshot."
     ],
     replica: [
       type: {:in, [:full, :default]},
@@ -69,7 +72,7 @@ defmodule Electric.Client.Stream do
           )
 
   @opts_schema NimbleOptions.new!(
-                 live: [type: :boolean, default: true],
+                 live: [type: {:in, [true, false, :sse]}, default: true],
                  resume: [type: {:struct, Message.ResumeMessage}],
                  errors: [
                    type: {:in, [:raise, :stream]},
@@ -78,7 +81,7 @@ defmodule Electric.Client.Stream do
                )
 
   @type opts :: %{
-          live: boolean(),
+          live: boolean() | :sse,
           resume: nil | Message.ResumeMessage.t(),
           errors: :raise | :stream
         }
@@ -87,6 +90,7 @@ defmodule Electric.Client.Stream do
           id: integer(),
           client: Client.t(),
           poll_state: ShapeState.t(),
+          sse_worker: nil | {pid(), reference()},
           parser: nil | {module(), term()},
           buffer: :queue.queue(),
           replica: Client.replica(),
@@ -155,12 +159,37 @@ defmodule Electric.Client.Stream do
     end
   end
 
+  defp do_fetch(%S{sse_worker: worker} = stream) when not is_nil(worker) do
+    case Client.SSE.next(worker) do
+      {result, messages, state} when result in [:ok, :must_refetch] ->
+        stream |> Map.put(:poll_state, state) |> handle_messages(messages) |> dispatch()
+
+      {:error, error} ->
+        handle_error(error, stream)
+    end
+  end
+
+  defp do_fetch(%S{opts: %{live: :sse}, poll_state: %{up_to_date?: true}} = stream) do
+    client = %{stream.client | parser: stream.parser || stream.client.parser}
+    worker = Client.SSE.start(client, stream.poll_state, stream.replica)
+    stream = %{stream | sse_worker: worker}
+
+    do_fetch(stream)
+  end
+
   defp do_fetch(%S{} = stream) do
     # Use the parser from stream config or fall back to client's parser
     parser = stream.parser || stream.client.parser
     client_with_parser = %{stream.client | parser: parser}
 
-    case Poll.request(client_with_parser, stream.poll_state, replica: stream.replica) do
+    result =
+      try do
+        Poll.request(client_with_parser, stream.poll_state, replica: stream.replica)
+      rescue
+        error in Client.Error -> {:error, error}
+      end
+
+    case result do
       {:ok, messages, new_poll_state} ->
         stream
         |> Map.put(:poll_state, new_poll_state)
@@ -213,7 +242,7 @@ defmodule Electric.Client.Stream do
     {:cont, stream}
   end
 
-  defp handle_up_to_date(%{opts: %{live: true}} = stream) do
+  defp handle_up_to_date(%{opts: %{live: live}} = stream) when live in [true, :sse] do
     # Clear fast-loop tracking — rapid polling is expected in live mode
     {:cont, %{stream | poll_state: ShapeState.clear_fast_loop(stream.poll_state)}}
   end
@@ -224,11 +253,15 @@ defmodule Electric.Client.Stream do
   end
 
   defp handle_error(error, %{opts: %{errors: :stream}} = stream) do
+    close(stream)
+    stream = %{stream | sse_worker: nil}
+
     %{stream | buffer: :queue.in(error, stream.buffer), state: :done}
     |> dispatch()
   end
 
-  defp handle_error(error, _stream) do
+  defp handle_error(error, stream) do
+    close(stream)
     raise error
   end
 
@@ -276,6 +309,8 @@ defmodule Electric.Client.Stream do
     stream
   end
 
+  def close(stream), do: Client.SSE.close(stream.sse_worker)
+
   defimpl Enumerable do
     alias Electric.Client
 
@@ -283,7 +318,8 @@ defmodule Electric.Client.Stream do
     def member?(_stream, _element), do: {:error, __MODULE__}
     def slice(_stream), do: {:error, __MODULE__}
 
-    def reduce(_stream, {:halt, acc}, _fun) do
+    def reduce(stream, {:halt, acc}, _fun) do
+      Client.Stream.close(stream)
       {:halted, acc}
     end
 
@@ -293,11 +329,21 @@ defmodule Electric.Client.Stream do
 
     def reduce(stream, {:cont, acc}, fun) do
       case Client.Stream.next(stream) do
-        {:halt, _stream} ->
+        {:halt, stream} ->
+          Client.Stream.close(stream)
           {:done, acc}
 
         {[entry], stream} ->
-          reduce(stream, fun.(entry, acc), fun)
+          result =
+            try do
+              fun.(entry, acc)
+            catch
+              kind, reason ->
+                Client.Stream.close(stream)
+                :erlang.raise(kind, reason, __STACKTRACE__)
+            end
+
+          reduce(stream, result, fun)
 
         {[], stream} ->
           reduce(stream, {:cont, acc}, fun)

@@ -483,6 +483,18 @@ defmodule Electric.Client do
         {:ok, client} = Electric.Client.new(base_url: "http://localhost:3000")
         stream = Electric.Client.stream(client, from(t in MyApp.Todos.Todo, where: t.completed == false))
 
+  To use Server-Sent Events with the HTTP adapter, pass `live: :sse`:
+
+      Electric.Client.stream(client, "todos", live: :sse)
+
+  The initial snapshot uses ordinary requests. After reaching `up-to-date`, each
+  enumeration uses a dedicated SSE connection (`live=true&live_sse=true`). Messages
+  are yielded individually after a complete batch arrives. Reconnects resume from
+  the last completed checkpoint. Proxies must stream chunks without buffering and
+  forward Electric headers. Unsupported fetchers (including Embedded) report a
+  `Electric.Client.Error` using the configured error mode. Long polling remains
+  the default.
+
   If you want to pass options to your stream, then pass them as the second
   argument or use `stream/3`.
   """

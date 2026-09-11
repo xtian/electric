@@ -1,5 +1,11 @@
 # @core/elixir-client
 
+## Unreleased
+
+- Add opt-in `live: :sse` for HTTP streams with dedicated connections, incremental
+  SSE framing, batch backpressure, checkpoint recovery, and enumeration cleanup.
+  Long polling remains the default; Embedded does not support SSE.
+
 ## 0.10.3
 
 ### Patch Changes

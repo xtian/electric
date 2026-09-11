@@ -35,7 +35,7 @@ defmodule Electric.Client.Fetch.Request do
     offset: quote(do: Electric.Client.offset()),
     shape_handle: quote(do: Electric.Client.shape_handle() | nil),
     replica: quote(do: Electric.Client.replica()),
-    live: quote(do: boolean()),
+    live: quote(do: boolean() | :sse),
     next_cursor: quote(do: Electric.Client.cursor()),
     params: quote(do: params()),
     headers: quote(do: headers())
@@ -112,7 +112,8 @@ defmodule Electric.Client.Fetch.Request do
     |> Map.merge(%{"offset" => to_string(offset)})
     |> Util.map_put_if("replica", to_string(replica), replica != :default)
     |> Util.map_put_if("handle", shape_handle, is_binary(shape_handle))
-    |> Util.map_put_if("live", "true", live?)
+    |> Util.map_put_if("live", "true", live? in [true, :sse])
+    |> Util.map_put_if("live_sse", "true", live? == :sse)
     |> Util.map_put_if("cursor", to_string(cursor), !is_nil(cursor))
   end
 

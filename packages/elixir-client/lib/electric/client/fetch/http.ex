@@ -83,6 +83,45 @@ defmodule Electric.Client.Fetch.HTTP do
     |> request()
   end
 
+  @impl Electric.Client.Fetch
+  def stream(request, opts, emit) do
+    timestamp = DateTime.utc_now()
+    marker = make_ref()
+
+    into = fn {:data, data}, {req, resp} ->
+      action =
+        if Process.get(marker) do
+          :cont
+        else
+          Process.put(marker, true)
+          emit.({:response, Fetch.Response.decode!(resp.status, resp.headers, [], timestamp)})
+        end
+
+      action = if action == :cont, do: emit.({:data, data}), else: :halt
+      {action, {req, resp}}
+    end
+
+    try do
+      request
+      |> build_request(opts)
+      |> Req.Request.put_header("accept", "text/event-stream")
+      |> Req.request(into: into, retry: false, decode_body: false, compressed: false)
+      |> case do
+        {:ok, resp} ->
+          unless Process.get(marker) do
+            emit.({:response, Fetch.Response.decode!(resp.status, resp.headers, [], timestamp)})
+          end
+
+          :ok
+
+        {:error, error} ->
+          {:error, error}
+      end
+    after
+      Process.delete(marker)
+    end
+  end
+
   @doc false
   def build_request(%Fetch.Request{authenticated: true} = request, opts) do
     request_opts = Keyword.get(opts, :request, [])
@@ -238,7 +277,8 @@ defmodule Electric.Client.Fetch.HTTP do
     |> then(retry_delay_fun)
   end
 
-  defp retry_delay(n) do
+  @doc false
+  def retry_delay(n) do
     # Full jitter strategy (AWS recommended), minimum 1ms:
     #   random_between(1, min(cap, base * 2^n))
     # See: https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
@@ -269,20 +309,21 @@ defmodule Electric.Client.Fetch.HTTP do
     status in status_codes
   end
 
-  defp transient?(%Req.Response{} = response, is_transient_fun) do
+  @doc false
+  def transient?(%Req.Response{} = response, is_transient_fun) do
     is_transient_fun.(response)
   end
 
-  defp transient?(%Req.TransportError{reason: reason}, _is_transient_fun)
-       when reason in [:timeout, :econnrefused, :closed] do
+  def transient?(%Req.TransportError{reason: reason}, _is_transient_fun)
+      when reason in [:timeout, :econnrefused, :closed] do
     true
   end
 
-  defp transient?(%Req.HTTPError{protocol: :http2, reason: :unprocessed}, _is_transient_fun) do
+  def transient?(%Req.HTTPError{protocol: :http2, reason: :unprocessed}, _is_transient_fun) do
     true
   end
 
-  defp transient?(%{__exception__: true}, _is_transient_fun) do
+  def transient?(%{__exception__: true}, _is_transient_fun) do
     false
   end
 end
