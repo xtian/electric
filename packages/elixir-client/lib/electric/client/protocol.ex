@@ -21,13 +21,16 @@ defmodule Electric.Client.Protocol do
       {:error, %Fetch.Response{status: 409} = resp} ->
         handle_must_refetch(resp, client, state, shape_key)
 
-      {:error, %Fetch.Response{body: body} = resp} ->
-        {:error, %Client.Error{message: unwrap_error(body), resp: resp}}
+      {:error, %Fetch.Response{} = resp} ->
+        {:error, response_error(resp)}
 
       {:error, error} ->
         {:error, %Client.Error{message: "Unable to retrieve data", resp: error}}
     end
   end
+
+  def response_error(%Fetch.Response{body: body} = resp),
+    do: %Client.Error{message: unwrap_error(body), resp: resp}
 
   def build_request(client, state, replica, shape_key) do
     %{

@@ -1,7 +1,7 @@
 defmodule Electric.Client.SSE do
   @moduledoc false
   alias Electric.Client
-  alias Electric.Client.{Fetch, Protocol, ShapeKey}
+  alias Electric.Client.{Fetch, Protocol, ShapeKey, ShapeState}
   alias Electric.Client.SSE.Decoder
 
   # One worker per enumeration, never registered in the shared request pool.
@@ -154,14 +154,14 @@ defmodule Electric.Client.SSE do
 
     case result do
       {:stale, state} ->
-        state = catch_up(client, %{state | up_to_date?: false}, replica, owner, [])
+        state = catch_up(client, %{state | up_to_date?: false}, replica, owner)
         Process.put(__MODULE__, %{ctx | state: state})
         loop(client, replica, owner, opts, failure_start, attempts)
 
       {:reset, reset} ->
         {:must_refetch, _, state} = reset
         deliver(owner, reset)
-        state = catch_up(client, state, replica, owner, [])
+        state = catch_up(client, state, replica, owner)
         Process.put(__MODULE__, %{ctx | state: state})
         loop(client, replica, owner, opts, now(), 0)
 
@@ -184,10 +184,10 @@ defmodule Electric.Client.SSE do
 
         Process.sleep(delay)
         # A partial frame is also an interrupted batch. Re-fetch from the last
-        # committed checkpoint, buffering all finite catch-up pages atomically.
+        # committed checkpoint, yielding finite catch-up pages with backpressure.
         state =
           if ctx.pending != [] or ctx.decoder.line != [] or ctx.decoder.data != [] do
-            catch_up(client, %{ctx.state | up_to_date?: false}, replica, owner, [])
+            catch_up(client, %{ctx.state | up_to_date?: false}, replica, owner)
           else
             ctx.state
           end
@@ -233,6 +233,11 @@ defmodule Electric.Client.SSE do
   defp emit({:data, data}, client, key, owner) do
     ctx = Process.get(__MODULE__)
 
+    if is_nil(ctx.response) do
+      raise Client.Error,
+        message: "Fetch.stream/3 must emit response metadata before data"
+    end
+
     if ctx.response.status in 200..299 do
       decoder = Decoder.feed(ctx.decoder, data, &event(&1, client, key, owner))
       Process.put(__MODULE__, %{Process.get(__MODULE__) | decoder: decoder})
@@ -260,6 +265,10 @@ defmodule Electric.Client.SSE do
 
         case result do
           {:ok, _, state} ->
+            state = ShapeState.clear_fast_loop(state)
+            {:ok, messages, _} = result
+            result = {:ok, messages, state}
+
             Process.put(__MODULE__, %{
               ctx
               | state: state,
@@ -295,6 +304,8 @@ defmodule Electric.Client.SSE do
 
   defp validate_message!(_), do: raise(Client.Error, message: "Invalid SSE message payload")
 
+  # The server emits up-to-date only after all operations through this LSN.
+  # Resume after the whole transaction, not after its first operation (L_0).
   defp checkpoint!(lsn) when is_integer(lsn) and lsn >= 0, do: "#{lsn}_inf"
 
   defp checkpoint!(lsn) when is_binary(lsn) do
@@ -306,37 +317,61 @@ defmodule Electric.Client.SSE do
 
   defp checkpoint!(_), do: raise(Client.Error, message: "Invalid SSE checkpoint")
 
-  defp catch_up(client, state, replica, owner, batches) do
+  defp catch_up(client, state, replica, owner) do
+    state = check_catch_up_loop(state, owner)
+
     case Protocol.request(client, state, replica: replica) do
       {:ok, messages, state} ->
-        batches = [messages | batches]
+        state = if state.up_to_date?, do: ShapeState.clear_fast_loop(state), else: state
+        deliver(owner, {:ok, messages, state})
 
         if state.up_to_date? do
-          deliver(owner, {:ok, batches |> Enum.reverse() |> List.flatten(), state})
           state
         else
-          case Electric.Client.ShapeState.check_fast_loop(state) do
-            {:ok, state} ->
-              catch_up(client, state, replica, owner, batches)
-
-            {:backoff, delay, state} ->
-              Process.sleep(delay)
-              catch_up(client, state, replica, owner, batches)
-
-            {:error, message} ->
-              raise Client.Error, message: message
-          end
+          catch_up(client, state, replica, owner)
         end
 
       {:must_refetch, _, state} = result ->
         deliver(owner, result)
-        catch_up(client, state, replica, owner, [])
+        catch_up(client, state, replica, owner)
 
       {:stale_retry, state} ->
-        catch_up(client, state, replica, owner, batches)
+        catch_up(client, state, replica, owner)
 
       {:error, error} ->
         raise error
+    end
+  end
+
+  defp check_catch_up_loop(state, owner) do
+    case ShapeState.check_fast_loop(state) do
+      {:ok, state} ->
+        state
+
+      {:backoff, delay, checked} ->
+        checked =
+          if checked.fast_loop_consecutive_count == 1 do
+            # The guard rewinds to a fresh snapshot. Pages may already have
+            # reached the consumer, so reset its view and our tag index together.
+            reset = ShapeState.reset(checked, nil)
+
+            message = %Client.Message.ControlMessage{
+              control: :must_refetch,
+              handle: nil,
+              request_timestamp: DateTime.utc_now()
+            }
+
+            deliver(owner, {:must_refetch, [message], reset})
+            reset
+          else
+            checked
+          end
+
+        if delay > 0, do: Process.sleep(delay)
+        checked
+
+      {:error, message} ->
+        raise Client.Error, message: message
     end
   end
 
@@ -387,10 +422,7 @@ defmodule Electric.Client.SSE do
 
   defp wrap_error(%Client.Error{} = error), do: error
 
-  defp wrap_error({:http, resp}) do
-    {:error, error} = Protocol.handle_response({:error, resp}, nil, nil, nil)
-    error
-  end
+  defp wrap_error({:http, resp}), do: Protocol.response_error(resp)
 
   defp wrap_error(error), do: %Client.Error{message: "Unable to consume SSE data", resp: error}
   defp now, do: System.monotonic_time(:millisecond)

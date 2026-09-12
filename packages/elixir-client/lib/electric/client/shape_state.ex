@@ -109,6 +109,9 @@ defmodule Electric.Client.ShapeState do
 
   Used when a 409 (must-refetch) response is received — the shape handle changes
   but the schema remains the same.
+
+  Retry history survives resets so repeated 409s remain detectable. Clear it
+  explicitly with `clear_fast_loop/1` after reaching up-to-date.
   """
   @spec reset(t(), Client.shape_handle()) :: t()
   def reset(%__MODULE__{} = state, shape_handle) do
@@ -120,8 +123,6 @@ defmodule Electric.Client.ShapeState do
         next_cursor: nil,
         tag_to_keys: %{},
         key_data: %{},
-        recent_requests: [],
-        fast_loop_consecutive_count: 0,
         disjunct_positions: nil
     }
   end

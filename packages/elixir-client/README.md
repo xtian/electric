@@ -42,7 +42,17 @@ continuation to release it. Consumer death also closes the connection.
 
 Reconnects authenticate again and resume from the last completed batch's Electric
 checkpoint. Interrupted batches are discarded and recovered through non-live
-requests before SSE resumes. Keepalives refresh `receive_timeout` (milliseconds
+requests before SSE resumes. Recovery yields each completed HTTP page on demand,
+just like the initial snapshot; `up-to-date` marks completion. An error or reset
+may follow pages already delivered. Only unfinished live SSE batches remain
+buffered until `up-to-date`.
+
+SSE checkpoints use `LSN_inf`: the server emits `up-to-date` after all operations
+through that LSN, so resumption starts after the entire transaction.
+`request_timestamp` records HTTP request start, not event receipt or commit time;
+all batches on one SSE connection share it. Use checkpoints for stream position.
+
+Keepalives refresh `receive_timeout` (milliseconds
 in the HTTP fetcher's `request` options); `timeout` (seconds) limits repeated
 connection failures, not the lifetime of a healthy stream.
 

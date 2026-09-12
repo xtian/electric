@@ -62,14 +62,27 @@ defmodule Electric.Client.SSEIntegrationTest do
     assert_receive {:message, %ChangeMessage{value: %{"id" => ^first}}}, 10_000
     assert_receive {:message, %ControlMessage{control: :up_to_date}}, 10_000
     assert_receive {:sse_request, _}, 10_000
-    {:ok, second} = insert_item(ctx)
+
+    {:ok, {second, same_transaction}} =
+      with_transaction(ctx, fn tx ->
+        {:ok, second} = insert_item(tx)
+        {:ok, same_transaction} = insert_item(tx)
+        {second, same_transaction}
+      end)
+
     assert_receive {:message, %ChangeMessage{value: %{"id" => ^second}}}, 10_000
+    assert_receive {:message, %ChangeMessage{value: %{"id" => ^same_transaction}}}, 10_000
 
     assert_receive {:message, %ControlMessage{control: :up_to_date, global_last_seen_lsn: lsn}},
                    10_000
 
     checkpoint = "#{lsn}_inf"
     assert_receive {:sse_request, ^checkpoint}, 10_000
+    {:ok, after_reconnect} = insert_item(ctx)
+    assert_receive {:message, %ChangeMessage{value: %{"id" => ^after_reconnect}}}, 10_000
+    assert_receive {:message, %ControlMessage{control: :up_to_date}}, 10_000
+    refute_receive {:message, %ChangeMessage{value: %{"id" => ^second}}}, 100
+    refute_receive {:message, %ChangeMessage{value: %{"id" => ^same_transaction}}}, 100
     Postgrex.query!(ctx.db_conn, "TRUNCATE TABLE \"#{ctx.tablename}\"", [])
     assert_receive {:message, %ControlMessage{control: :must_refetch}}, 10_000
     assert_receive {:message, %ControlMessage{control: :up_to_date}}, 10_000

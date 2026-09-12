@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Preserve fast-loop protection across shape resets and apply it to SSE recovery.
+  Yield recovery pages on demand, improve SSE fetcher errors, and reduce decoder
+  allocations while retaining live-batch backpressure.
+
 - Add opt-in `live: :sse` for HTTP streams with dedicated connections, incremental
   SSE framing, batch backpressure, checkpoint recovery, and enumeration cleanup.
   Long polling remains the default; Embedded does not support SSE.

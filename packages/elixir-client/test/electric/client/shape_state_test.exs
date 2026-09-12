@@ -111,7 +111,7 @@ defmodule Electric.Client.ShapeStateTest do
   end
 
   describe "reset/2" do
-    test "clears fast-loop state" do
+    test "preserves fast-loop state across handle changes" do
       state = %{
         ShapeState.new(offset: Offset.new(5, 0), shape_handle: "old-handle")
         | recent_requests: [{0, Offset.new(5, 0)}],
@@ -122,8 +122,8 @@ defmodule Electric.Client.ShapeStateTest do
 
       assert new_state.shape_handle == "new-handle"
       assert new_state.offset == Offset.before_all()
-      assert new_state.recent_requests == []
-      assert new_state.fast_loop_consecutive_count == 0
+      assert new_state.recent_requests == state.recent_requests
+      assert new_state.fast_loop_consecutive_count == 3
     end
   end
 

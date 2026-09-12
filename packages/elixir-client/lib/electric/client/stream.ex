@@ -272,6 +272,10 @@ defmodule Electric.Client.Stream do
     end
   end
 
+  # Recovery requests and their counters belong to the worker after SSE starts.
+  defp check_fast_loop(%{sse_worker: worker} = stream) when not is_nil(worker),
+    do: {:ok, stream}
+
   defp check_fast_loop(%{poll_state: %{up_to_date?: true}} = stream), do: {:ok, stream}
 
   defp check_fast_loop(%{poll_state: poll_state} = stream) do

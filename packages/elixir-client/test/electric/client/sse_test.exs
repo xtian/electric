@@ -165,7 +165,7 @@ defmodule Electric.Client.SSETest do
     end
   end
 
-  test "interrupted batch is discarded and finite catch-up is buffered" do
+  test "interrupted batch is discarded and recovered through finite requests" do
     bypass = Bypass.open()
     owner = self()
 
@@ -257,7 +257,7 @@ defmodule Electric.Client.SSETest do
              client |> Client.stream("items", live: :sse, resume: resume()) |> Enum.take(2)
   end
 
-  test "recovery buffers multiple finite pages until up-to-date" do
+  test "recovery yields pages before up-to-date and fetches only on demand" do
     bypass = Bypass.open()
     owner = self()
 
@@ -277,27 +277,212 @@ defmodule Electric.Client.SSETest do
         true ->
           assert conn.query_params["offset"] == "2_0"
           refute conn.query_params["live"]
-          send(owner, {:page, self()})
-
-          receive do
-            :finish -> :ok
-          end
+          send(owner, :final_page_requested)
 
           conn |> headers("application/json") |> resp(200, Jason.encode!([up(2)]))
       end
     end)
 
-    task =
-      Task.async(fn ->
-        client(bypass, request: [retry_delay: 1])
-        |> Client.stream("items", live: :sse, resume: resume())
-        |> Enum.take(2)
+    stream =
+      client(bypass, request: [retry_delay: 1])
+      |> Client.stream("items", live: :sse, resume: resume())
+
+    {:suspended, %ChangeMessage{key: "2"}, next} =
+      Enumerable.reduce(stream, {:cont, nil}, fn msg, _ -> {:suspend, msg} end)
+
+    refute_receive :final_page_requested, 30
+    assert {:suspended, %ControlMessage{control: :up_to_date}, halt} = next.({:cont, nil})
+    assert_receive :final_page_requested
+    halt.({:halt, nil})
+  end
+
+  for transport <- [:poll, :http, :event] do
+    @tag timeout: 15_000
+    test "repeated 409s terminate through the fast-loop guard after #{transport}" do
+      bypass = Bypass.open()
+      owner = self()
+
+      Bypass.expect(bypass, fn conn ->
+        conn = fetch_query_params(conn)
+        send(owner, :requested)
+
+        if conn.query_params["live_sse"] == "true" and unquote(transport) == :event do
+          conn
+          |> headers()
+          |> resp(200, event(%{"headers" => %{"control" => "must-refetch"}}))
+        else
+          conn
+          |> headers("application/json")
+          |> put_resp_header("electric-handle", "next")
+          |> resp(409, "[]")
+        end
       end)
 
-    assert_receive {:page, server}, 3000
-    assert Task.yield(task, 30) == nil
-    send(server, :finish)
-    assert [%ChangeMessage{key: "2"}, %ControlMessage{}] = Task.await(task)
+      opts =
+        if unquote(transport) == :poll,
+          do: [live: true, errors: :stream],
+          else: [live: :sse, resume: resume(), errors: :stream]
+
+      messages = client(bypass) |> Client.stream("items", opts) |> Enum.to_list()
+      assert %Client.Error{message: message} = List.last(messages)
+      assert message =~ "stuck in a fast retry loop"
+      assert Enum.any?(messages, &match?(%ControlMessage{control: :must_refetch}, &1))
+      assert_receive :requested
+    end
+  end
+
+  for failure <- [:reset, :error, :rewind] do
+    test "recovery handles #{failure} after a page has been delivered" do
+      bypass = Bypass.open()
+      tagged = put_in(row(2), ["headers", "tags"], ["tag-a"])
+
+      Bypass.expect(bypass, fn conn ->
+        conn = fetch_query_params(conn)
+
+        cond do
+          conn.query_params["live_sse"] ->
+            conn |> headers() |> resp(200, event(row(99)))
+
+          conn.query_params["offset"] == "-1" ->
+            move_out = %{
+              "headers" => %{
+                "event" => "move-out",
+                "patterns" => [%{"pos" => 0, "value" => "tag-a"}]
+              }
+            }
+
+            conn
+            |> headers("application/json")
+            |> put_resp_header("electric-handle", "new")
+            |> resp(200, Jason.encode!([move_out, row(3), up(3)]))
+
+          conn.query_params["offset"] == "1_inf" ->
+            conn
+            |> headers("application/json")
+            |> put_resp_header("electric-offset", "2_0")
+            |> resp(200, Jason.encode!([tagged]))
+
+          unquote(failure) == :rewind ->
+            conn
+            |> headers("application/json")
+            |> put_resp_header("electric-offset", "2_0")
+            |> resp(200, "[]")
+
+          true ->
+            status = if unquote(failure) == :reset, do: 409, else: 403
+
+            conn
+            |> headers("application/json")
+            |> put_resp_header("electric-handle", "new")
+            |> resp(status, Jason.encode!(["denied"]))
+        end
+      end)
+
+      stream =
+        client(bypass, request: [retry_delay: 1])
+        |> Client.stream("items", live: :sse, resume: resume(), errors: :stream)
+
+      if unquote(failure) == :error do
+        assert [%ChangeMessage{key: "2"}, %Client.Error{message: "denied"}] = Enum.to_list(stream)
+      else
+        assert [
+                 %ChangeMessage{key: "2"},
+                 %ControlMessage{control: :must_refetch},
+                 %ChangeMessage{key: "3"},
+                 %ControlMessage{control: :up_to_date}
+               ] = Enum.take(stream, 4)
+      end
+    end
+  end
+
+  test "request timestamps identify the connection across completed batches" do
+    bypass = Bypass.open()
+
+    Bypass.expect_once(bypass, fn conn ->
+      conn
+      |> headers()
+      |> resp(200, event(row(2)) <> event(up(2)) <> event(row(3)) <> event(up(3)))
+    end)
+
+    messages =
+      client(bypass) |> Client.stream("items", live: :sse, resume: resume()) |> Enum.take(4)
+
+    assert [%DateTime{}] = messages |> Enum.map(& &1.request_timestamp) |> Enum.uniq()
+  end
+
+  for recovery? <- [false, true] do
+    test "worker clears fast-loop tracking at up-to-date with recovery=#{recovery?}" do
+      bypass = Bypass.open()
+
+      Bypass.expect(bypass, fn conn ->
+        conn = fetch_query_params(conn)
+
+        if conn.query_params["live_sse"] do
+          messages = if unquote(recovery?), do: event(row(99)), else: event(up(2))
+          conn |> headers() |> resp(200, messages)
+        else
+          conn
+          |> headers("application/json")
+          |> put_resp_header("electric-offset", "2_inf")
+          |> resp(200, Jason.encode!([row(2), up(2)]))
+        end
+      end)
+
+      client =
+        client(bypass, request: [retry_delay: 1])
+        |> Client.merge_params(%{"table" => "items"})
+
+      state = %{
+        Client.ShapeState.from_resume(resume())
+        | fast_loop_consecutive_count: 2,
+          value_mapper_fun: fn values -> values end
+      }
+
+      worker = Client.SSE.start(client, state, :default)
+
+      try do
+        assert {:ok, _, completed} = Client.SSE.next(worker)
+        assert completed.up_to_date?
+        assert completed.recent_requests == []
+        assert completed.fast_loop_consecutive_count == 0
+      after
+        Client.SSE.close(worker)
+      end
+    end
+  end
+
+  test "HTTP error construction does not interpret 409 as a state transition" do
+    for status <- [403, 409, 500] do
+      response = %Client.Fetch.Response{status: status, body: ["denied"]}
+
+      assert %Client.Error{message: "denied", resp: ^response} =
+               Client.Protocol.response_error(response)
+    end
+  end
+
+  test "decoder handles large lines and dispatches coalesced events synchronously" do
+    value = String.duplicate("x", 100_000)
+    input = "data: " <> value <> "\r\ndata: tail\r\n\r\ndata: next\n\n"
+    parent = self()
+
+    task =
+      Task.async(fn ->
+        Decoder.feed(%Decoder{}, input, fn event ->
+          send(parent, {:decoded, event})
+
+          receive do
+            :continue -> :ok
+          end
+        end)
+      end)
+
+    expected = value <> "\ntail"
+    assert_receive {:decoded, ^expected}
+    refute_receive {:decoded, "next"}, 30
+    send(task.pid, :continue)
+    assert_receive {:decoded, "next"}
+    send(task.pid, :continue)
+    assert %Decoder{line: [], data: []} = Task.await(task)
   end
 
   test "permanent HTTP errors preserve ordinary response bodies" do

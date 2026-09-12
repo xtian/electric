@@ -23,6 +23,24 @@ defmodule Electric.Client.SSELifecycleTest do
     def fetch(_, _), do: raise("must not poll")
   end
 
+  defmodule DataBeforeMetadata do
+    @behaviour Client.Fetch
+    def validate_opts(opts), do: {:ok, opts}
+    def fetch(_, _), do: raise("must not poll")
+    def stream(_, _, emit), do: emit.({:data, "data: {}\n\n"})
+  end
+
+  test "data before metadata reports the fetcher contract violation in both error modes" do
+    client = Client.new!(base_url: "http://localhost:1", fetch: {DataBeforeMetadata, []})
+
+    assert_raise Client.Error, ~r/response metadata before data/, fn ->
+      client |> stream() |> Enum.to_list()
+    end
+
+    assert [%Client.Error{message: message}] = client |> stream(errors: :stream) |> Enum.to_list()
+    assert message =~ "response metadata before data"
+  end
+
   defmodule Authenticator do
     def authenticate_request(request, owner) do
       token = Integer.to_string(System.unique_integer([:positive]))
